@@ -1,0 +1,81 @@
+---
+title: "Compare demand estimates"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/04/27
+# Scott Carnie-Bronca
+
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+pacman::p_load(tidyverse, lubridate, sp, leaflet, gridExtra, broom, doParallel, GGally)
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+
+cl = doParallel::registerDoParallel(cores = parallel::detectCores())
+```
+
+## Load data
+```{r loadDate}
+# select only the files with estimatedLambda
+filenames = list.files(path = "./", pattern = ".csv") %>% 
+  str_subset("estimatedLambda") %>%
+  str_remove(".csv")
+
+filenames = tibble(raw = filenames)
+filenames = filenames %>%
+  mutate(nCell = str_extract(raw, "n[:digit:]+$"),
+         nCell = case_when(
+           is.na(nCell) ~ "n10",
+           TRUE         ~ nCell
+         ),
+         nCell = as.numeric(str_remove(nCell, "n")),
+         type = str_remove_all(str_extract(raw, "_[:alpha:]{3,}_{0,}"), "[:punct:]"),
+         type = case_when(
+           is.na(type) ~ "standard",
+           TRUE        ~ type
+         ))
+```
+
+## Load demands
+```{r}
+demand = list()
+for(k in 1:nrow(filenames)){
+  demand[[k]] = read.csv(paste("./", filenames$raw[[k]], ".csv", sep = ""), header = FALSE) %>% as.matrix()
+  dimnames(demand[[k]]) <- c(NULL, NULL)
+}
+
+demands = filenames %>% add_column(demand)
+```
+
+## Compare in each cell number group
+```{r}
+nCells = unique(demands$nCell) %>% sort()
+
+comparison = list()
+for(i in 1:length(nCells)){
+  n = nCells[i]
+  comparison[[i]] = tibble(cell = 0:(n^2-1))
+  demand_temp = demands %>% filter(nCell == n)
+  for(j in 1:nrow(demand_temp)){
+    comparison[[i]] = comparison[[i]] %>%
+      mutate("{demand_temp$type[j]}" := demand_temp$demand[[j]] %>% as.vector())
+  }
+  comparison[[i]] = comparison[[i]] %>%
+    pivot_longer(cols = -cell, names_to = "estimation_type")
+}
+
+```
+
+## Plots
+```{r}
+comparison[[1]] %>% filter(value > 0) %>% ggplot(aes(x = cell, y = value, col = estimation_type)) + geom_point(alpha = 0.5) + labs(title = paste0("n = ", nCells[1]))
+comparison[[2]] %>% filter(value > 0) %>% ggplot(aes(x = cell, y = value, col = estimation_type)) + geom_point(alpha = 0.5) + labs(title = paste0("n = ", nCells[2]))
+comparison[[3]] %>% filter(value > 0) %>% ggplot(aes(x = cell, y = value, col = estimation_type)) + geom_point(alpha = 0.5) + labs(title = paste0("n = ", nCells[3]))
+comparison[[4]] %>% filter(value > 0) %>% ggplot(aes(x = cell, y = value, col = estimation_type)) + geom_point(alpha = 0.5) + labs(title = paste0("n = ", nCells[4]))
+comparison[[4]] %>% filter(value > 0, estimation_type != "redists") %>% ggplot(aes(x = cell, y = value, col = estimation_type)) + geom_point(alpha = 0.5) + labs(title = paste0("n = ", nCells[4])) +scale_y_log10()
+```

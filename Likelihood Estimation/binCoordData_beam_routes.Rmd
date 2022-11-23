@@ -1,0 +1,111 @@
+---
+title: "Route binning + speed"
+output: html_document
+---
+
+
+# Status data
+## Load data
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/05/19
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = "../") #mac: "~/Box/MPhil" windows: "C:/Users/Scott/Box/MPhil/"
+
+#Libraries
+pacman::p_load(tidyverse, lubridate, sp, leaflet)
+#Functions
+
+source('../Likelihood Estimation/bin_coords.R')
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+options(pillar.sigfig = 7)
+```
+
+```{r loadData}
+data = as_tibble(read.csv("../Data Analysis/beam_routesCleaned_trimmed.csv", row.names = 1))
+data
+```
+
+## Bin Data
+Bin the data using the non-built in R function bin_coords. Minimum/maximum coordinates are the tight CBD bounds. 
+```{r binData}
+n = 50 #n bins on each axis
+minlat = -34.9425
+maxlat = -34.8975
+minlon = 138.575
+maxlon = 138.625
+
+# Filter to binning range
+data = data %>%
+  filter(lat > minlat, lat < maxlat, lon > minlon, lon < maxlon)
+
+
+lat = data$lat
+lon = data$lon
+
+binnedList = bin_coords(lat, lon, n, minlat, maxlat, minlon, maxlon)
+binnedInd = binnedList[[1]]
+binnedBreaks = binnedList[[2]]
+
+ggplot() +
+  geom_bin2d(aes(x = longitudeInd, y = latitudeInd), binnedInd, binwidth = 1)
+```
+
+## Construct lists with each
+A new data frame is constructed with pickup/dropoff times and the cell numbers for each trip.
+```{r constructDataFrameByCell}
+#Construct data frame
+dataCell = data %>%
+  add_column(lat_ind = binnedInd$latitudeInd,
+             lon_ind = binnedInd$longitudeInd)
+                 
+#Add cell number
+dataCell = dataCell %>%
+  mutate(cell_num = (lat_ind-1) + n*(lon_ind-1),
+         cell_num = (lat_ind-1) + n*(lon_ind-1))
+#Sort by time in each cell
+dataCell = dataCell %>%
+  group_by(cell_num) %>%
+  arrange(time)
+
+dataCell
+```
+
+## Save binned data
+
+```{r saveData}
+write.csv(dataCell, "../Likelihood Estimation/routes_binned_beam.csv")
+```
+
+## Instantaneous Speed
+```{r}
+pacman::p_load(geodist)
+
+# Add time and distance, then speed
+dataCell = dataCell %>% ungroup()
+dataCell = dataCell %>%
+  group_by(trip_id) %>%
+  mutate(t_diff = time-lag(time),
+         dist = geodist_vec(lon, lat, sequential = TRUE, pad = TRUE),
+         speed = 1000*dist/t_diff) %>%
+  drop_na() %>%
+  filter(speed < 20) #remove very high speed values
+
+
+
+dataCell %>% ggplot(aes(x = time, y = speed)) + geom_point()
+
+dataCell %>% ggplot(aes(x = speed)) + geom_density()
+
+dataCell %>% ungroup() %>% mutate(day_of_week = factor(wday(as.POSIXct(time/1000, origin = origin))), is_weekend = (day_of_week == 6 | day_of_week == 7)) %>% ggplot(aes(x = speed, col = day_of_week)) + geom_density()
+
+dataCell %>% ungroup() %>% slice_sample(n = 1e6) %>% mutate(day_of_week = factor(wday(as.POSIXct(time/1000, origin = origin))), is_weekend = (day_of_week == 6 | day_of_week == 7), time = factor(floor_date(as.POSIXct(time/1000, origin = origin), unit = "days"))) %>% ggplot(aes(y = speed, x = time, col = is_weekend)) + geom_violin()
+
+dataCell %>% group_by(lon_ind, lat_ind) %>% summarise(speed = speed) %>% ggplot(aes(x = lon_ind, y = lat_ind, fill = speed)) + geom_raster()
+```
+
+Majority of trips are <5m/s, which agrees with the speed limit of about 15km/hr \approx 4.2m/s
+

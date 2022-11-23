@@ -1,0 +1,540 @@
+---
+title: "Estimate demand - Beam data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/08/02
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+pacman::p_load(tidyverse, lubridate, sp, leaflet)
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+```
+
+
+## Hire threshold: how many hires are required to get an estimate of demand. Time threshold: minimum time in seconds to get an estimate of demand
+```{r}
+pickup_threshold = 10
+time_threshold = 3600
+```
+
+# Beam
+## Load data
+```{r}
+n = 100 #number of bins on each axis
+
+trips = read.csv("./trips_binned_beam.csv", row.names = 1) %>% as_tibble()
+status = read.csv("./status_binned_r_beam.csv", row.names = 1) %>% as_tibble() %>% mutate(event_time = ymd_hms(event_time))
+```
+
+## Get the last locations for each scooter
+```{r}
+last_locations = status %>%
+  arrange(location_timestamp) %>%
+  group_by(vehicle_id) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+last_locations %>% ggplot(aes(x = lon, y = lat)) + geom_point()
+last_locations %>% ggplot(aes(x = event_time, col = event_type_reason)) + geom_histogram(binwidth = 3600*12)
+last_populations = last_locations$cell_num %>% table()
+last_populations
+```
+
+Using snapshot data:
+```{r, eval = FALSE}
+snapshot_filenames = list.files("../Data/Output/Snapshots/")
+max_file_ind = min(which(ymd_hms(gsub(".json", "", snapshot_filenames), tz = "Australia/Adelaide") >= max(ymd_hms(status$event_time, tz = "Australia/Adelaide"), na.rm = TRUE))) # find the first snapshot that takes place after the status data
+
+last_snapshot = jsonlite::read_json(paste0("../Data/Output/Snapshots/", snapshot_filenames[max_file_ind]), simplifyVector = TRUE) %>% as_tibble()
+
+source("bin_coords.R")
+minlat = -34.9425
+maxlat = -34.8975
+minlon = 138.575
+maxlon = 138.625
+
+get_cell_num = function(lat, lon) {
+  X = bin_coords(lat, lon, n, minlat, maxlat, minlon, maxlon)
+  out = (X[[1]]$latitudeInd-1) + n*(X[[1]]$longitudeInd-1)
+  return(out)
+}
+
+last_snapshot = last_snapshot %>% 
+  filter(lat > minlat, lat < maxlat, lon > minlon, lon < maxlon) %>%
+  mutate(cell_num = get_cell_num(lat, lon))
+
+last_snapshot %>% ggplot(aes(x = lon, y = lat)) + geom_point()
+last_populations = last_snapshot$cell_num %>% table()
+last_populations
+```
+
+
+## For each cell, find periods of time when scooters are not present.
+```{r}
+current_population = rep(0, n^2)
+current_population[as.numeric(names(last_populations))+1] = last_populations
+cell_status = tibble(cell = 0, n_pickups = 0, nzi_start = 0, nzi_end = 0)
+nzi_end = rep(max(status$location_timestamp), n^2) #end time of non-zero-population interval
+n_pickups = rep(0, n^2) #number of pickups since the previous time no scooters were available
+
+status = status %>%
+  mutate(change = case_when(
+    event_type_reason %in% c("user_drop_off", "maintenance_drop_off", "redistribution_in", "extra_drop_off") ~ 1,
+    event_type_reason %in% c("user_pick_up",  "maintenance_pick_up", "redistribution_out", "extra_pick_up") ~ -1,
+    TRUE                                                                                   ~ 0
+  ))
+
+status %>%
+  group_by(cell_num) %>%
+  summarise(final_change = sum(change)) %>%
+  pull(final_change) %>%
+  table
+
+status = status %>%
+  filter(cell_num >= 0)
+
+cell_populations = tibble(cell = 0, n_in_cell = 0, t = 0) #check scooter counts
+
+for(k in nrow(status):1){
+  t = status$location_timestamp[k] #what time did the event occur at
+  cell = status$cell_num[k] #what cell did the event occur in
+  change = status$change[k] #how did the scooter count change at this time
+  type = status$event_type_reason[k]
+  cell_population = current_population[cell+1] #cell population after the event
+  current_population[cell+1] = current_population[cell+1] - change
+  
+  # Debugging
+  cell_populations = cell_populations %>% add_row(cell = cell, n_in_cell = cell_population, t = t)
+  #if(current_population[cell] < 0){print(paste(k, current_population[cell], cell, status$vehicle_id[k], type))}
+  
+  if(cell_population == 0){ 
+    #print(1)
+    #if the number of scooters reaches 0 after the event
+   
+    if(type == "user_pick_up"){n_pickups[cell+1] = n_pickups[cell+1] + 1} 
+          
+    nzi_end[cell+1] = t
+    #print(paste("update nzi_end: ", cell, t, nzi_end[cell]))
+
+    
+  } else {
+    #print(2)
+    if(current_population[cell+1] == 0){
+      #print(3)
+      #if the cell population leaves 0 at the event
+
+      # Update tibble
+      #print(paste("update cell status: ", cell, n_pickups[cell], t, nzi_end[cell]))
+      cell_status = cell_status %>%
+        add_row(cell, n_pickups = n_pickups[cell+1], nzi_start = t, nzi_end = nzi_end[cell+1])
+      n_pickups[cell+1] = 0
+      nzi_end[cell+1] = 0
+    } else {
+      #print(4)
+      #if the cell population is > 0 either side of the event
+      if(type == "user_pick_up"){n_pickups[cell+1] = n_pickups[cell+1] + 1}
+    }
+  }
+}
+cell_status = cell_status[-1,]
+cell_status
+```
+
+## Plot
+```{r}
+cell_populations = cell_populations %>% filter(cell > 0) %>% group_by(cell) %>% mutate(i = row_number())
+
+cell_populations %>% ungroup() %>% mutate(i_overall = row_number()) %>% ggplot(aes(x = i_overall, y = n_in_cell, group = cell)) + geom_line()
+cell_populations %>% ungroup() %>% mutate(i_overall = row_number()) %>% ggplot(aes(x = i, y = n_in_cell, group = cell)) + geom_line()
+```
+
+## Proportion of cells with scooters over time
+```{r}
+first_day = min(floor_date(as.POSIXct(status$location_timestamp/1000, tz = "Australia/Adelaide", origin = origin), "day"))
+tz(first_day) <- "Australia/Adelaide"
+last_day = max(floor_date(as.POSIXct(status$location_timestamp/1000, tz = "Australia/Adelaide", origin = origin), "day"))
+tz(last_day) <- "Australia/Adelaide"
+timeBreaks = seq(first_day, last_day, by = "DSTday")
+timeBreaks = as.numeric(rep(timeBreaks, each = 48) + rep(1800*(0:47), times = length(timeBreaks)))*1000
+
+cell_populations$t_regular = NA
+
+cell_populations = cell_populations %>%
+  ungroup() %>%
+  add_row(t = timeBreaks, t_regular = timeBreaks) %>%
+  arrange(t) %>%
+  fill(t_regular, .direction = "up") %>%
+  drop_na(cell)
+
+cell_populations %>%
+  group_by(t_regular, cell) %>%
+  slice_tail() %>%
+  group_by(t_regular) %>%
+  complete(cell = 0:(n^2-1), fill = list(n_in_cell = 0)) %>%
+  summarise(p_greater_zero = sum(n_in_cell > 0)/n^2, p_equal_zero = sum(n_in_cell == 0)/n^2) %>%
+  mutate(t_regular = as.POSIXct(t_regular/1000, tz = "Australia/Adelaide", origin = origin), p_greater_zero = p_greater_zero*4) %>%
+  ggplot(aes(x = t_regular, y = p_greater_zero)) + geom_line() +# + geom_line(aes(y = p_equal_zero), col = "red")
+  labs(y = "Proportion of cells with scooters", x = "Time") + coord_cartesian(ylim = c(0, 0.25)) + theme_bw()
+ggsave("./cells_with_scooters.pdf", width = 6, height = 4)
+```
+
+## Estimate demand
+```{r}
+cell_status = cell_status %>%
+  mutate(demand = 1000*n_pickups/(nzi_end-nzi_start))
+
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, unweighted_demand =mean(demand), weighted_demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  arrange(-unweighted_demand)
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, unweighted_demand = mean(demand), weighted_demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  arrange(-weighted_demand)
+
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, unweighted_demand =mean(demand), weighted_demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  ggplot(aes(x = unweighted_demand, y = weighted_demand, col = n_hires)) + geom_point() + geom_abline()
+
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, unweighted_demand =mean(demand), weighted_demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  ggplot(aes(x = unweighted_demand, y = weighted_demand, col = log10(nonzero_time))) + geom_point() + geom_abline()
+
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, unweighted_demand =mean(demand), weighted_demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  pivot_longer(cols = c("unweighted_demand", "weighted_demand"), names_to = "mean_type") %>%
+  ggplot(aes(x = n_hires, y = value, col = mean_type)) + geom_point()
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, unweighted_demand =mean(demand), weighted_demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  pivot_longer(cols = c("unweighted_demand", "weighted_demand"), names_to = "mean_type") %>%
+  ggplot(aes(x = nonzero_time, y = value, col = mean_type)) + geom_point()
+```
+
+## Plot
+```{r}
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = mean(demand)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold, demand < 0.5) %>%
+  complete(cell = 0:(n^2-1), fill = list(demand = 0, nonzero_time = 0, n_hires = 0)) %>%
+  mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + geom_tile()
+
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = n_hires/nonzero_time) %>%
+  drop_na() %>%
+  mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1) %>%
+  #filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + geom_tile()
+
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  #filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  mutate(lat_ind = ((cell + 1) %% n), lon_ind = ((cell) %/% n) + 1,
+         #demand = case_when(
+        #   demand > 0.0005 ~ 0.0005,
+        #   TRUE           ~ demand
+         #)
+        ) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + geom_tile()
+```
+
+## Filter out inaccurate estimates
+```{r}
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = mean(demand)) %>%
+  drop_na() %>%
+  mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1) %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + geom_raster()
+
+
+
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = n_hires/nonzero_time) %>%
+  drop_na() %>%
+  mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1) %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + geom_raster()
+
+cell_status %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  mutate(lat_ind = ((cell + 1) %% n), lon_ind = ((cell) %/% n) + 1,
+         #demand = case_when(
+        #   demand > 0.0005 ~ 0.0005,
+        #   TRUE           ~ demand
+         #)
+        ) %>%
+  complete(lat_ind = 1:n, lon_ind = 1:n, fill = list(demand = 0)) %>%
+  mutate(demand = demand*3600) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + 
+  geom_raster() + labs(fill = "Demand (hires/hr)", x = "", y = "") + 
+  scale_fill_gradient2(low = "#173603", mid = "#6eff0d", high = "#ffffff", midpoint = 1, na.value = "#290e00") + 
+  coord_fixed(ratio = 1) + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    panel.background = element_blank()
+  )
+
+# Save for Stoneham
+ggsave("./demand_est.png", width = 5, height = 4) 
+```
+
+## Save demands
+```{r}
+demand = cell_status %>%
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups, na.rm = TRUE), nonzero_time = sum(nzi_end-nzi_start, na.rm = TRUE)/1000, demand = n_hires/nonzero_time) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  complete(cell = 0:(n^2-1), fill = list(demand = 0))
+
+demands = matrix(demand$demand, byrow = FALSE, ncol = n) #convert demand to a matrix (for compatibility with earlier demand estimation)
+
+demands %>% write.table("../Likelihood Estimation/estimatedLambda_beam.csv", sep = ",", row.names = FALSE, col.names = FALSE)
+```
+
+# Split by time of day
+
+## Define times to split by
+```{r}
+first_day = min(floor_date(status$event_time, "day"))
+tz(first_day) <- "Australia/Adelaide"
+last_day = max(floor_date(status$event_time, "day"))
+tz(last_day) <- "Australia/Adelaide"
+timeBreaks = seq(first_day, last_day, by = "DSTday")
+timeBreaks = rep(timeBreaks, each = 5) + rep(c(0, 6*3600, 12*3600, 15*3600, 19*3600), times = length(timeBreaks))
+
+status = status %>%
+  add_row(tibble(
+    location_timestamp = 1000*as.numeric(timeBreaks),
+    cell_num = 0,
+    event_type_reason = "time_break"
+  )) %>%
+  arrange(location_timestamp)
+```
+
+## For each time, find periods of time when scooters are not present.
+```{r}
+current_population = rep(0, n^2)
+current_population[names(last_populations) %>% as.numeric] = last_populations
+cell_status = tibble(cell = 0, n_pickups = 0, nzi_start = 0, nzi_end = 0, reason = "temp")
+nzi_end = rep(max(status$location_timestamp), n^2) #end time of non-zero-population interval
+n_pickups = rep(0, n^2) #number of pickups since the previous time no scooters were available
+in_interval = rep(FALSE, n^2)
+status = status %>%
+  mutate(change = case_when(
+    event_type_reason %in% c("user_drop_off", "maintenance_drop_off", "redistribution_in", "extra_drop_off") ~ 1,
+    event_type_reason %in% c("user_pick_up",  "maintenance_pick_up", "redistribution_out", "extra_pick_up") ~ -1,
+    TRUE                                                              ~ 0
+  ))
+
+cell_populations = tibble(cell = 0, n_in_cell = 0) #check scooter counts
+
+for(k in nrow(status):1){ #(nrow(status)-10000)
+  
+  t = status$location_timestamp[k] #what time did the event occur at
+  #print(paste("loop", k))
+  # If the row is a time break
+  if(status$event_type_reason[k] == "time_break"){ #if there is a time split
+    #print("time break")
+    #temp_tibble = tibble(cell = 0, n_pickups = 0, nzi_start = 0, nzi_end = 0)
+    temp_cell = c()
+    temp_n_pickups = c()
+    temp_nzi_start = c()
+    temp_nzi_end = c()
+    for(cell in which(in_interval)){#for each cell
+      #print(paste("time break, cell", cell))
+      if(in_interval[cell+1]){ #if the interval is being split
+        #print("needs updating")
+        temp_cell = c(temp_cell, cell)
+        temp_n_pickups = c(temp_n_pickups, n_pickups[cell+1])
+        temp_nzi_start = c(temp_nzi_start, t)
+        temp_nzi_end = c(temp_nzi_end, nzi_end[cell+1])
+        
+        # temp_tibble = rbind(temp_tibble, tibble_row(cell, n_pickups = n_pickups[cell], nzi_start = t, nzi_end = nzi_end[cell]))
+        nzi_end[cell+1] = t
+        n_pickups[cell+1] = 0
+      }
+    }
+    cell_status = cell_status %>% add_row(cell = temp_cell, n_pickups = temp_n_pickups, nzi_start = temp_nzi_start, nzi_end = temp_nzi_end, reason = "time")
+    next
+  }
+  cell = status$cell_num[k] #what cell did the event occur in
+  change = status$change[k] #how did the scooter count change at this time
+  type = status$event_type_reason[k]
+  cell_population = current_population[cell+1] #cell population after the event
+  current_population[cell+1] = current_population[cell+1] - change
+  cell_populations = cell_populations %>% add_row(cell = cell, n_in_cell = cell_population)
+  if(cell_population == 0){ 
+    #print(1)
+    #if the number of scooters reaches 0 after the event
+   
+    if(type == "user_pick_up"){n_pickups[cell+1] = n_pickups[cell+1] + 1} 
+          
+    in_interval[cell+1] = TRUE
+    nzi_end[cell+1] = t
+    #print(paste("update nzi_end: ", cell, t, nzi_end[cell]))
+
+    
+  } else {
+    #print(2)
+    cell_population_before = cell_population - change
+    if(cell_population_before == 0){
+      #print(3)
+      #if the cell population leaves 0 at the event
+
+      # Update tibble
+      #print(paste("update cell status: ", cell, n_pickups[cell], t, nzi_end[cell]))
+      cell_status = cell_status %>%
+        add_row(cell, n_pickups = n_pickups[cell+1], nzi_start = t, nzi_end = nzi_end[cell+1], reason = "data")
+      in_interval[cell+1] = FALSE
+      n_pickups[cell+1] = 0
+      nzi_end[cell+1] = 0
+    } else {
+      #print(4)
+      #if the cell population is > 0 either side of the event
+      if(type == "user_pick_up"){n_pickups[cell+1] = n_pickups[cell+1] + 1}
+    }
+  }
+}
+cell_status = cell_status[-1,]
+cell_status
+```
+
+```{r}
+cell_status = cell_status %>% 
+  mutate(nzi_start_time = as.POSIXct(nzi_start/1000, origin = origin, tz = "Australia/Adelaide"), 
+         hour = hour(nzi_start_time), 
+         day = wday(nzi_start_time))
+cell_status = cell_status %>% mutate(desc = paste(
+    case_when(
+        hour %in% 0:5 ~ "EarlyMorning",
+        hour %in% 6:11 ~ "Morning",
+        hour %in% 12:14 ~ "EarlyAfternoon",
+        hour %in% 15:18 ~ "Afternoon",
+        hour %in% 19:23 ~ "Evening",
+        TRUE ~ "NA"
+    ), case_when(
+        day %in% c(6,7) ~ "Weekend",
+        day %in% 1:5 ~ "Weekday",
+        TRUE ~ "NA"
+    ),
+    sep = ""
+))
+
+cell_status %>%
+  group_by(desc, cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = n_hires/nonzero_time) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + geom_raster() + facet_wrap(~desc)
+
+cell_status %>%
+  group_by(desc, cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = n_hires/nonzero_time) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  ggplot(aes(x = nonzero_time, y = demand)) + geom_point() + facet_wrap(~desc) + scale_y_log10()
+
+cell_status %>%
+  group_by(desc, cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = n_hires/nonzero_time) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1,
+         time_length = case_when(
+           str_detect(desc, "^EarlyMorning") ~ 6,
+           str_detect(desc, "^Morning") ~ 6,
+           str_detect(desc, "^EarlyAfternoon") ~ 3,
+           str_detect(desc, "^Afternoon") ~ 4,
+           str_detect(desc, "^Evening") ~ 5
+         )) %>%
+  filter(nonzero_time > (as.numeric(last_day-first_day) * (3600/5) *  time_length)) %>% #if 3600/x, must have scooters at least 1/xth of the time
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + geom_raster() + facet_wrap(~desc)
+```
+
+## Save demands
+```{r}
+timeDesc = expand_grid(time = 0:23, day = 1:7) %>%
+  mutate(desc = paste(
+    case_when(
+      time %in% 0:5 ~ "EarlyMorning",
+      time %in% 6:11 ~ "Morning",
+      time %in% 12:14 ~ "EarlyAfternoon",
+      time %in% 15:18 ~ "Afternoon",
+      time %in% 19:23 ~ "Evening",
+      TRUE ~ "NA"
+    ), case_when(
+      day %in% c(6,7) ~ "Weekend",
+      day %in% 1:5 ~ "Weekday",
+      TRUE ~ "NA"
+    ),
+    sep = ""
+  ))
+
+for(k in unique(timeDesc$desc)){
+  demand_out = cell_status %>%
+    filter(desc == k) %>%
+    group_by(cell) %>%
+    summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = n_hires/nonzero_time) %>%
+    drop_na() %>%
+    filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+    complete(cell = 1:n^2, fill = list(demand = 0))
+  demand_out$demand %>% 
+    matrix(byrow = FALSE, ncol = n) %>% 
+    write.table(paste0("./Demands/demand_", k, "_beam.csv"), sep = ",", row.names = FALSE, col.names = FALSE)
+}
+```
+
+# Plot cell populations
+```{r}
+cell_populations = cell_populations %>% filter(cell > 0) %>% group_by(cell) %>% mutate(i = row_number())
+
+cell_populations %>% ggplot(aes(x = i, y = n_in_cell, group = cell)) + geom_line()
+
+cell_populations_summary = cell_populations %>% 
+  group_by(cell) %>%
+  summarise(min_n = min(n_in_cell), max_n = max(n_in_cell), mean_n = mean(n_in_cell))
+
+cell_populations_summary %>% mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = -min_n)) + geom_raster()
+cell_populations_summary %>% mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = max_n)) + geom_raster()
+cell_populations_summary %>% mutate(lat_ind = ((cell) %% n) + 1, lon_ind = ((cell) %/% n) + 1) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = mean_n)) + geom_raster()
+```
+

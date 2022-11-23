@@ -1,0 +1,246 @@
+---
+title: "Estimate demand - Beam data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/08/31
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+pacman::p_load(tidyverse, lubridate, sp, leaflet, foreach)
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+doParallel::registerDoParallel(cores = parallel::detectCores())
+```
+
+
+## Hire threshold: how many hires are required to get an estimate of demand. Time threshold: minimum time in seconds to get an estimate of demand
+```{r}
+pickup_threshold = 0
+time_threshold = 0
+```
+
+# Ride
+## Load data
+```{r}
+n = 50 #number of bins on each axis
+
+trips = read.csv("./binnedData.csv", row.names = 1) %>% as_tibble() 
+snapshots = read.csv("./snapshotBinned.csv", row.names = 1) %>% as_tibble()
+```
+
+## Reformat trip data
+```{r}
+trips = trips %>% 
+  select(vehicleNumber, pickupTime, dropoffTime, pickupCellNum, dropoffCellNum) %>%
+  pivot_longer(cols = c(pickupCellNum, dropoffCellNum)) %>%
+  transmute(vehicle_id = vehicleNumber,
+            event_type = str_extract(name, "pickup|dropoff"),
+            event_time = case_when(
+              event_type == "pickup" ~ pickupTime,
+              event_type == "dropoff" ~ dropoffTime
+            ),
+            event_time_numeric = as.numeric(ymd_hms(event_time, tz = "Australia/Adelaide")),
+            cell_num = value
+  )
+```
+
+## Reformat snapshot data
+```{r}
+snapshots = snapshots %>%
+  transmute(time = ymd_hms(DataDate, tz = "Australia/Adelaide"), cell_num = cellNum, times_numeric = as.numeric(time))
+```
+
+## Define times - snapshot times
+```{r}
+times = unique(snapshots$times_numeric)
+n_times = length(times)-1
+```
+
+## Add columns to status data frame
+```{r}
+trips = trips %>%
+  mutate(event_time = ymd_hms(event_time),
+         change = case_when(
+           event_type %in% c("dropoff") ~ 1,
+           event_type %in% c("pickup")  ~ -1,
+           TRUE                         ~ 0
+         )) %>%
+  arrange(event_time_numeric)
+```
+
+## Complete demand estimation code
+```{r}
+demands = foreach(j = 1:n_times, .combine = c, .packages = c("lubridate", "tidyverse")) %dopar% {
+  cell_populations = tibble(cell = 0, n_in_cell = 0, t = 0, time_window = 0) #check scooter counts
+  # Get INITIAL scooter locations
+  t_start = times[j]
+  t_end = times[j+1]
+  
+  # Find data points that are useful for finding the location of each scooter
+  
+  initial_locations = snapshots %>% filter(time == t_start) %>%
+    pull(cell_num) %>%
+    table
+  
+  # Loop through
+  cells_with_scooters = 0:(n^2-1) %in% names(initial_locations) #which cells have scooters
+  trips_month = trips %>% filter(event_time_numeric >= times[j], event_time_numeric <= times[j+1])
+  next_population = rep(0, n^2)
+  next_population[names(initial_locations) %>% as.numeric + 1] = initial_locations
+  cell_status = tibble(cell = NA_real_, n_pickups = 0, nzi_start = 0, nzi_end = 0)
+  nzi_start = rep(times[j], n^2)*cells_with_scooters #start time of non-zero-population interval
+  n_pickups = rep(0, n^2) #number of pickups since the previous time scooters were available
+  
+  if(nrow(trips_month) > 0){ #if things happen
+    for(k in 1:nrow(trips_month)){
+      t = trips_month$event_time_numeric[k] #what time did the event occur at
+      cell = trips_month$cell_num[k] #what cell did the event occur in
+      change = trips_month$change[k] #how did the scooter count change at this time
+      type = trips_month$event_type[k]
+      cell_population = next_population[cell+1] #cell population before the event
+      next_population[cell+1] = next_population[cell+1] + change #cell population after the change
+      
+      # Debugging
+      cell_populations = cell_populations %>% add_row(cell = cell, n_in_cell = cell_population, t = t, time_window = j)
+      
+      
+      if(cell_population == 0){
+        #print(1)
+        #if the number of scooters leaves 0 after the event
+        
+        #if(type == "user_pick_up"){n_pickups[cell+1] = n_pickups[cell+1] + 1}
+        cells_with_scooters[cell+1] = TRUE
+        nzi_start[cell+1] = t
+        #print(paste("update nzi_start: ", cell, t, nzi_start[cell+1]))
+        
+        
+      } else {
+        #print(2)
+        if(next_population[cell+1] == 0){
+          #print(3)
+          #if the cell population reaches 0 after the event
+          
+          if(type == "pickup"){n_pickups[cell+1] = n_pickups[cell+1] + 1}
+          
+          # Update tibble
+          #print(paste("update cell status: ", cell, n_pickups[cell+1], t, nzi_start[cell+1]))
+          cells_with_scooters[cell+1] = FALSE
+          cell_status = cell_status %>%
+            add_row(cell, n_pickups = n_pickups[cell+1], nzi_start = nzi_start[cell+1], nzi_end = t)
+          n_pickups[cell+1] = 0
+          nzi_start[cell+1] = -1 #this should be reset after the scooter count leaves 0
+        } else {
+          #print(4)
+          #if the cell population is > 0 either side of the event
+          if(type == "pickup"){n_pickups[cell+1] = n_pickups[cell+1] + 1}
+        }
+      }
+    }
+  }
+  # End intervals
+  for(cell in (which(cells_with_scooters)-1)){
+    cells_with_scooters[cell+1] = FALSE
+    cell_status = cell_status %>%
+      add_row(cell, n_pickups = n_pickups[cell+1], nzi_start = nzi_start[cell+1], nzi_end = t_end)
+    n_pickups[cell+1] = 0
+    nzi_start[cell+1] = 0
+  }
+  list(demands = cell_status %>% mutate(month = j), cell_populations = cell_populations) #return
+}
+
+cell_populations = demands[[2]]
+demands_table = demands[[1]]
+
+for(k in 3:length(demands)){
+  if(k %% 2 == 0){
+    cell_populations = rbind(cell_populations, demands[[k]])
+  } else {
+    demands_table = rbind(demands_table, demands[[k]])
+  }
+}
+
+demands_table = demands_table %>% drop_na(cell)
+cell_populations = cell_populations %>% drop_na(cell)
+```
+
+```{r}
+cell_populations = cell_populations %>% filter(cell >= 0) %>% group_by(cell, time_window) %>% mutate(i = row_number()) %>% ungroup()
+# 
+# cell_populations %>% ungroup() %>% mutate(i_overall = row_number()) %>% ggplot(aes(x = i_overall, y = n_in_cell, group = cell)) + geom_line() + facet_wrap(~time_window)
+# cell_populations %>% ungroup() %>% mutate(i_overall = row_number()) %>% ggplot(aes(x = i, y = n_in_cell, group = cell)) + geom_line() + facet_wrap(~time_window)
+
+cell_populations = cell_populations %>% filter(cell >= 0) %>% group_by(cell) %>% mutate(i = row_number()) %>% ungroup()
+
+cell_populations %>% ungroup() %>% mutate(i_overall = row_number()) %>% ggplot(aes(x = i_overall, y = n_in_cell, group = cell)) + geom_line()
+cell_populations %>% ungroup() %>% mutate(i_overall = row_number()) %>% ggplot(aes(x = i, y = n_in_cell, group = cell)) + geom_line()
+```
+
+## Estimate demand
+```{r}
+demands_table = demands_table %>%
+  mutate(demand = n_pickups/(nzi_end-nzi_start))
+
+```
+
+## Filter out inaccurate estimates
+```{r}
+demands_table %>% 
+  group_by(cell) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  mutate(lat_ind = ((cell + 1) %% n), lon_ind = ((cell) %/% n) + 1,
+         #demand = case_when(
+         #   demand > 0.0005 ~ 0.0005,
+         #   TRUE           ~ demand
+         #)
+  ) %>%
+  ungroup() %>%
+  complete(lat_ind = 1:50, lon_ind = 1:50, fill = list(demand = 0)) %>%
+  mutate(demand = demand*3600) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = demand)) + 
+  geom_raster() + labs(fill = "Demand (hires/hr)", x = "", y = "") + 
+  #scale_fill_gradient2(low = "#173603", mid = "#6eff0d", high = "#ffffff", midpoint = 1, na.value = "#290e00") + 
+  coord_fixed(ratio = 1) + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    panel.background = element_blank()
+  )# + facet_wrap(~month)
+
+# Save for Stoneham
+ggsave("./demand_est_ride.png", width = 5, height = 4) 
+```
+
+# Overall demand estimates by month
+```{r}
+demands_table %>% 
+  group_by(cell, month) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  mutate(lat_ind = ((cell + 1) %% n), lon_ind = ((cell) %/% n) + 1) %>%
+  group_by(month) %>%
+  complete(lat_ind = 1:50, lon_ind = 1:50, fill = list(demand = 0)) %>%
+  summarise(demand = sum(demand)) %>%
+  mutate(month_start = times[month], demand_hr = demand*3600)
+```
+
+```{r}
+demands_table %>% 
+  group_by(cell, month) %>%
+  summarise(n_hires = sum(n_pickups), nonzero_time = sum(nzi_end-nzi_start)/1000, demand = weighted.mean(demand, nzi_end-nzi_start)) %>%
+  drop_na() %>%
+  filter(n_hires > pickup_threshold, nonzero_time > time_threshold) %>%
+  mutate(lat_ind = ((cell + 1) %% n), lon_ind = ((cell) %/% n) + 1) %>%
+  group_by(month) %>%
+  complete(lat_ind = 1:50, lon_ind = 1:50, fill = list(demand = 0)) %>%
+  summarise(demand = sum(demand)) %>%
+  mutate(month_start = times[month], demand_hr = demand*3600) %>%
+  ggplot(aes(x = month_start, y = demand_hr)) + geom_col()
+```

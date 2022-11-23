@@ -1,0 +1,523 @@
+---
+title: "Simulated Annealing"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021-01-21
+
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = "../")
+set.seed(2021)
+
+pacman::p_load(tidyverse,
+               lubridate,
+               sp,
+               plotly,
+               foreach,
+               skimr,
+               optimization)
+
+cl = doParallel::registerDoParallel(16)
+
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday 
+```
+
+# Setup 
+
+## Parameters
+```{r}
+n = 50
+n_simulations = 16 #number of simulations to run
+flat_fee = 1 
+fee_per_sec = 0.38/60
+n_scooters = 1300 #number of scooters in the system. Requires sum(initial_deployment) == n_scooters, otherwise returns NA. Needs to be > 1
+n_steps = 1e5 #maximum number of steps in the simulation
+t_final = 2*3600 #final time after o, in seconds
+dt = 7200 #time step for output
+variation_amount = 2 #scale for variation; on average, this many scooters move this many cells in each axis
+```
+## Load data
+
+First, the binned data is loaded:
+```{r main_data}
+tz = "Australia/Adelaide"
+trips_data = read.csv("../Likelihood Estimation/trips_binned_beam.csv", row.names = 1)
+status_data = read.csv("../Likelihood Estimation/status_binned_beam.csv", row.names = 1)
+```
+
+Time descriptors:
+```{r} 
+timeDesc = expand_grid(time = 0:23, day = 1:7) %>%
+  mutate(desc = paste(
+    case_when(
+      time %in% 0:5 ~ "EarlyMorning",
+      time %in% 6:11 ~ "Morning",
+      time %in% 12:14 ~ "EarlyAfternoon",
+      time %in% 15:18 ~ "Afternoon",
+      time %in% 19:23 ~ "Evening",
+      TRUE ~ "NA"
+    ), case_when(
+      day %in% c(6,7) ~ "Weekend",
+      day %in% 1:5 ~ "Weekday",
+      TRUE ~ "NA"
+    ),
+    sep = ""
+  ))
+
+```
+
+Demand estimates:
+```{r demand_multi-time_data}
+filenames = list.files(path = "../Likelihood Estimation/Demands", pattern = "beam")
+filenames = filenames[!str_detect(filenames, "redists")] #not redistributions
+(nTimePairs = length(filenames))
+demands = array(dim = c(n, n, length(unique(timeDesc$desc))))
+for(k in 1:nTimePairs){
+  demands[ , ,k]  = read.csv(paste("../Likelihood Estimation/Demands/", filenames[k], sep = ""), header = FALSE) %>% as.matrix()
+}
+dimnames(demands)[[3]] <- gsub(".csv|_|beam|redists", "", filenames)
+```
+
+The trip time distribution parameters are loaded:
+```{r triptime_names}
+trip_time_params = read.csv("../Simulation/parameters_lognorm_beam.csv", row.names = 1) %>%
+  as_tibble() %>%
+  complete(pickup_cell_num = 0:(n^2-1), dropoff_cell_num = 0:(n^2-1), fill = list("mu" = 0, "sigma" = 0, "n_points" = 0))
+```
+
+Get trip probabilities:
+```{r}
+transProbs = trips_data %>% 
+  group_by(pickup_cell_num) %>%
+  mutate(n_pickups = n()) %>%
+  group_by(dropoff_cell_num, .add = TRUE) %>%
+  summarise(p = n()/mean(n_pickups))
+
+redist_dest_probs = transProbs # TEMPORARY, NEED TO CHANGE
+```
+
+Get battery usage:
+```{r}
+battery_df = read.csv("../Data Analysis/battery_usage_beam.csv", row.names = 1) %>%
+  as_tibble()
+```
+
+
+##Functions:
+```{r m2_functions}
+getHireTime = function(cell, demands, t, time_breaks){ #can take a vector of cells (1-n^2)
+  time_desc = names(time_breaks)[min(which(time_breaks <= t))]
+  l = demands[1+((cell-1)%%n), floor(1+(cell-1)/n), time_desc]
+  if(l > 0){
+    out = rexp(1, l)
+    if(out > time_breaks[min(which(time_breaks > t))]){
+      out = getHireTime(cell, demands, time_breaks[min(which(time_breaks > t))], time_breaks)
+      return(out)
+    } #if the hire time is after the next time break
+  } else {
+    out = Inf
+  }
+  
+  return(t + out)
+}
+
+getTripTime = function(cell, dest, trip_time_params){ #cell, dest are cell indices from 1 to n^2
+  rates = trip_time_params %>% filter(pickup_cell_num == cell & dropoff_cell_num == cell)
+  trip_duration = exp(rnorm(1, mean = rates$mu[1], sd = rates$sigma[1]))
+  return(trip_duration)
+}
+
+getNextDest = function(cell, transProbs){
+  out = cell
+  for(k in 1:length(cell)){
+    temp = transProbs[transProbs$pickup_cell_num == cell,]
+    if(nrow(temp) == 0){
+      out[k] = sample(unique(transProbs$dropoff_cell_num), size = 1)
+    } else if(nrow(temp) == 1){
+      out[k] = temp$dropoff_cell_num
+    } else {
+      out[k] = sample(temp$dropoff_cell_num, size = 1, prob = temp$p)
+    }
+    
+  }
+  out = replace(out, is.nan(out), sample(c(1:n^2), 1))
+  return(out)
+}
+```
+
+## Function to run a simulation and return the revenue over a time window
+```{r}
+single_sim = function(o, dt, t_final, initial_deployment, n_steps, n, n_scooters, flat_fee, fee_per_sec, status_table){
+  
+  # Time breaks (for non-homogeneous demand)
+  time_breaks = seq(floor_date(as.POSIXct(o, tz = tz, origin = origin), unit = "day"), by = "DSTday", length.out = ceiling(t_final/86400))
+  time_breaks = rep(time_breaks, each = 5) + rep(c(0, 6*3600, 12*3600, 15*3600, 19*3600), times = length(time_breaks))
+  time_desc_names = paste("demand", timeDesc$desc[timeDesc$time %in% hour(time_breaks) & timeDesc$day %in% wday(time_breaks)], sep = "")
+  time_breaks = as.numeric(time_breaks)
+  names(time_breaks) <- time_desc_names
+  # Initialisation
+  
+  t = rep(o, n_steps+1) #store the times
+  # t_regular = seq(from = 0, to = t_final, by = dt) #regular, hourly "snapshots". 6*3600 = 6 hours
+  # index_regular = 1 #current t_regular value
+  # 
+  # prop_in_use = rep(0, length(t_regular))
+  # 
+  total_revenue = 0
+  # revenue_regular = rep(0, length(t_regular))
+  # 
+  missed_trips = 0
+  # missed_trips_regular = rep(0, length(t_regular))
+  # 
+  trips = 0
+  # trips_regular = rep(0, length(t_regular))
+  
+  
+  # Get first hire times
+  status_table$next_hire = foreach(k = 1:n^2, .combine = c, .packages = c("lubridate")) %do% {getHireTime(k, demands, o, time_breaks)}
+  
+  
+    for(k in 1:n_steps){
+    #print(k)
+    t[k] = min(status_table$next_hire, flatten_dbl(status_table$inbound_scooters_next_time))#, o + t_regular[index_regular])
+    if(t[k] > o + t_final){break}
+    # if(t[k] == o + t_regular[index_regular]){ # if the next time is at a reporting point
+    #   prop_in_use[index_regular] = sum(sapply(status_table$inbound_scooters_id, length))/n_scooters # (number of inbound scooters)/n_scooters
+    #   revenue_regular[index_regular] = total_revenue
+    #   missed_trips_regular[index_regular] = missed_trips
+    #   trips_regular[index_regular] = trips
+    #   index_regular = index_regular + 1
+    #   
+    #   if(index_regular > length(t_regular)){break} #end simulations
+    #   
+    # } else 
+    if(t[k] %in% status_table$next_hire){ # if a hire occurs
+      cell = status_table$cell[status_table$next_hire == t[k]]
+      cell = cell[1] #only select the first scooter to be updated
+      if(status_table$n_scooters[cell] == 0){ # if there are no scooters available
+        missed_trips = missed_trips + 1
+        status_table$next_hire[cell] = getHireTime(cell, demands, t[k], time_breaks)
+      } else { # if there is a scooter available
+        # Get trip details
+        trip_dest = getNextDest(cell, transProbs)
+        trip_length = getTripTime(cell, trip_dest, trip_time_params)
+        idle_battery_use = 0 #battery_df$battery_rate[(battery_df$cell_num == cell) & (battery_df$is_idle)]
+        trip_battery_use = battery_df$battery_rate[(battery_df$cell_num == trip_dest) & (!battery_df$is_idle)] * trip_length
+        valid_scooters = status_table$current_scooters_id[[cell]][(status_table$current_scooters_battery[[cell]]+idle_battery_use*(t[k]-status_table$current_scooters_last_moved[[cell]]) + trip_battery_use) > 0] #if the remaining battery is greater than the battery required for the trip
+        if(length(valid_scooters) > 0){
+          scooter_id = sample(valid_scooters, 1) #choose a random valid scooter
+          scooter = which(status_table$current_scooters_id[[cell]] == scooter_id)
+            
+          # Update revenue
+          total_revenue = total_revenue + flat_fee + fee_per_sec*trip_length
+          
+          # Update number of trips
+          trips = trips + 1
+          
+          # Update table
+          status_table$inbound_scooters_id[[trip_dest]] = c(status_table$inbound_scooters_id[[trip_dest]], status_table$current_scooters_id[[cell]][scooter])
+          status_table$inbound_scooters_next_time[[trip_dest]] = c(status_table$inbound_scooters_next_time[[trip_dest]], t[k] + trip_length)
+          status_table$inbound_scooters_battery[[trip_dest]] = c(status_table$inbound_scooters_battery[[trip_dest]], status_table$current_scooters_battery[[cell]][scooter] + idle_battery_use*(t[k] - status_table$current_scooters_last_moved[[cell]][scooter]) + trip_battery_use)
+          status_table$n_scooters[cell] = status_table$n_scooters[cell]-1
+          status_table$current_scooters_id[[cell]] = status_table$current_scooters_id[[cell]][-scooter]
+          status_table$current_scooters_battery[[cell]] = status_table$current_scooters_battery[[cell]][-scooter]
+          status_table$current_scooters_last_moved[[cell]] = status_table$current_scooters_last_moved[[cell]][-scooter]
+          status_table$next_hire[cell] = getHireTime(cell, demands, t[k], time_breaks)
+        } else { #if no scooters have enough battery
+          missed_trips = missed_trips + 1
+          status_table$next_hire[cell] = getHireTime(cell, demands, t[k], time_breaks)
+        }
+      }
+      
+    } else if(t[k] %in% flatten_dbl(status_table$inbound_scooters_next_time)){ # if a scooter arrives
+      # find scooter to update
+      cell = which(sapply(sapply(status_table$inbound_scooters_next_time, "%in%", t[k]), any))
+      cell = cell[1] #only select the first scooter to be updated
+      scooter = which.min(status_table$inbound_scooters_next_time[[cell]])
+      
+      # Update table
+      status_table$current_scooters_id[[cell]] = c(status_table$current_scooters_id[[cell]], status_table$inbound_scooters_id[[cell]][scooter])
+      status_table$current_scooters_battery[[cell]] = c(status_table$current_scooters_battery[[cell]], status_table$inbound_scooters_battery[[cell]][scooter])
+      status_table$current_scooters_last_moved[[cell]] = c(status_table$current_scooters_last_moved[[cell]], status_table$inbound_scooters_next_time[[cell]][scooter])
+      status_table$inbound_scooters_id[[cell]] = status_table$inbound_scooters_id[[cell]][-scooter]
+      status_table$inbound_scooters_next_time[[cell]] = status_table$inbound_scooters_next_time[[cell]][-scooter]
+      status_table$inbound_scooters_battery[[cell]] = status_table$inbound_scooters_battery[[cell]][-scooter]
+      status_table$n_scooters[cell] = status_table$n_scooters[cell] + 1
+    } else print(paste("something went wrong, loop", k))
+    }
+  return(tibble(revenue = total_revenue, trips = trips, missed_trips = missed_trips))
+}
+```
+
+## Multiple simulations
+```{r} 
+multi_sim = function(initial_deployment){
+  o = min(status_data$location_timestamp)/1000 #initial time
+  
+  ## Non-output array initialisation
+  ### List of cells
+  cells = 1:n^2
+  ### Initial scooter locations
+  scooter_id_list = as.character(1:n_scooters)
+  scooter_locations = initial_deployment #weight by all pickup locations in the trip data (temporary, for demonstration)]
+  scooter_battery = runif(n_scooters)
+  scooter_lastmoved = rep(o, n_scooters)
+  current_scooters_id = foreach(k = 1:n^2, .combine = c) %do% {list(c(NULL, scooter_id_list[scooter_locations == k]))}
+  current_scooters_battery = foreach(k = 1:n^2, .combine = c) %do% {list(c(NULL, scooter_battery[scooter_locations == k]))}
+  current_scooters_last_moved = foreach(k = 1:n^2, .combine = c) %do% {list(c(NULL, scooter_lastmoved[scooter_locations == k]))}
+  ### Inbound scooters + times
+  inbound_scooters_id = list(NULL)
+  inbound_scooters_next_time = list(NULL)
+  inbound_scooters_battery = list(NULL)
+  ### Next hire times
+  
+  
+  status_table = tibble(cell = cells, current_scooters_id, current_scooters_battery, current_scooters_last_moved, inbound_scooters_id, inbound_scooters_next_time, inbound_scooters_battery) %>% 
+    mutate(n_scooters = sapply(current_scooters_id, length))
+  
+  out = foreach(k = 1:n_simulations, .combine = rbind, .export = c("tz", "single_sim", "getHireTime", "getNextDest", "getTripTime", "demands", "timeDesc", "transProbs", "trip_time_params", "battery_df", "n", "n_simulations", "flat_fee", "fee_per_sec", "n_scooters", "n_steps", "t_final", "dt"), .packages = c("lubridate", "tidyverse", "foreach", "sp")) %dopar% {
+    df = single_sim(o, dt, t_final, initial_deployment, n_steps, n, n_scooters, flat_fee, fee_per_sec, status_table)
+    df
+  }
+  return(out)
+}
+```
+
+### Test simulation
+
+```{r}
+out = multi_sim(sample(names(table(trips_data$pickup_cell_num)), size = n_scooters, replace = TRUE, prob = table(trips_data$pickup_cell_num)))
+out %>% ggplot(aes(x = revenue)) + geom_histogram()
+out %>% ggplot(aes(x = missed_trips)) + geom_histogram()
+out %>% ggplot(aes(x = trips)) + geom_histogram()
+```
+
+# Optimization set-up
+
+## Initial values
+```{r}
+d_0 = rep(0, n^2)
+scooter_locations = sample(names(table(trips_data$pickup_cell_num)), size = n_scooters, replace = TRUE, prob = table(trips_data$pickup_cell_num))
+for(k in 1:n^2){d_0[k] = sum(scooter_locations == as.character(k))}
+```
+## Functions
+```{r}
+get_revenue = function(initial_deployment_vec){
+  # Input checking
+  if(sum(initial_deployment_vec) != n_scooters){ #must have the correct number of scooters
+    return(NA)
+  } else if(min(initial_deployment_vec) < 0){ #must have non-negative scooter counts
+    return(NA)
+  } else if(sum(round(initial_deployment_vec)-initial_deployment_vec) != 0){ #must be integer scooter counts
+    return(NA)
+  }
+  #Convert deployment format
+  initial_deployment = foreach(k = 1:n^2, .combine = c) %do% {rep(as.character(k), initial_deployment_vec[k])}
+  out = multi_sim(initial_deployment)
+  return(mean(out$revenue))
+}
+
+get_revenue(d_0)
+
+variation_function = function(para_0, fun_length, rf, temp = NA){
+  para_1 = foreach(k = 1:n^2, .combine = c) %do% {rep(k, para_0[k])}
+  latlon = cbind((1+((para_1-1)%%n)), floor(1+(para_1-1)/n))
+  
+  scooters_to_move = sample(1:nrow(latlon), max(1, floor(min(n_scooters, rexp(1, 1/mean(rf)))))) #random number of scooters to shift
+  for(k in scooters_to_move){
+    # Select distances in each direction
+    single_rf = rf[para_1[k]]
+    dists = rpois(2, rf) * (rbinom(2, 1, 0.5)-0.5)*2 #variation based on rf
+    latlon[k,] = pmin(50, pmax(1, latlon[k,] + dists))
+  }
+  para_1 = 50*(latlon[,2]-1) + latlon[,1]
+  para_2 = rep(0, n^2)
+  for(k in 1:n^2){para_2[k] = sum(para_1 == k)}
+  return(para_2)
+}
+```
+
+## Optimisation
+```{r, eval = FALSE}
+optim_out = optim_sa(
+  fun = get_revenue,
+  start = d_0,
+  trace = TRUE,
+  lower = rep(0, n^2),
+  upper = rep(n_scooters, n^2),
+  control = list(
+    nlimit = 50,
+    vf = variation_function
+  )
+)
+```
+
+```{r, eval = FALSE}
+optim_out
+
+plot(optim_out)
+
+optim_deployment = foreach(k = 1:n^2, .combine = c) %do% {rep(as.character(k), optim_out$par[k])}
+optim_deployment
+
+table(optim_out$par-d_0)
+```
+
+
+Plot cell populations:
+```{r, eval = FALSE}
+loops = optim_out$trace %>% 
+  as.tibble() %>%
+  pivot_longer(cols = x_1:rf_2500)
+
+top_cells = loops %>%
+  filter(str_detect(name, "x")) %>%
+  group_by(name) %>%
+  summarise(n = sum(value)) %>%
+  slice_max(n, n = 10) %>%
+  pull(name)
+
+loops %>% 
+  filter(str_detect(name, "x"), name %in% top_cells) %>%
+  ggplot(aes(x = n_outer, y = value, col = name)) + geom_line()
+```
+## Simulated annealing function
+```{r}
+#fun = objective function to maximise
+#vary_function = function that takes input x_k and returns a nearby x_k+1
+#x = deployment
+#T = temperature
+#max_iter = maximum iterations
+
+
+#based on wikipedia psuedocode
+simulated_annealing = function(fun, vary_function, x_0, T_0, a, max_iter){
+  x = matrix(nrow = max_iter+1, ncol = 3 + n^2) #store the output
+  x[1,] = c(0, x_0, T_0, fun(x_0))
+  
+  
+  x_k = x_0
+  T_k = T_0
+  for(k in 1:max_iter){
+    T_k = a*T_k
+    x_k = vary_function(x_k, n^2, variation_amount)
+    
+    prev_match = apply(x[,2:(n^2+1)], 1, function(x, vec) isTRUE(all.equal(x, vec)), x_k) #check if this solution occurred previously
+    if(any(prev_match)){
+      f_k = mean(fun(x_k), x[max(which(prev_match)), n^2+3])
+    } else { #if this is a new solution
+      f_k = fun(x_k)      
+    } 
+    
+    if(f_k > x[k, n^2+3]){ #if the new function value is higher, accept
+      x[k+1,] = c(k, x_k, T_k, f_k)
+    } else if(runif(1) < exp((f_k-x[k, n^2+3])/T_k)){ #if we accept a lower value
+      x[k+1,] = c(k, x_k, T_k, f_k)
+    } else { #do not accept, repeat the previous row
+      x[k+1,] = x[k,]
+      x[k+1,1] = k
+    }
+  }
+  return(x)
+}
+
+
+```
+
+Test function:
+```{r}
+x = simulated_annealing(get_revenue, variation_function, d_0, 100, 0.95, 1e5)
+
+colnames(x) = c("k", paste("x_", seq(1:n^2), sep = ""), "T_k", "f_k")
+x = x %>% 
+  as_tibble() %>%
+  pivot_longer(cols = x_1:x_2500)
+
+top_cells = x %>%
+  filter(str_detect(name, "x")) %>%
+  group_by(name) %>%
+  summarise(n = sum(value)) %>%
+  slice_max(n, n = 10) %>%
+  pull(name)
+
+x %>% 
+  filter(str_detect(name, "x"), name %in% top_cells) %>%
+  ggplot(aes(x = k, y = value, col = name)) + geom_line()
+
+x %>% 
+  filter(name == "x_1") %>%
+  ggplot(aes(x = k, y = f_k)) + geom_line()
+
+x %>% 
+  filter(name == "x_1") %>%
+  ggplot(aes(x = k, y = f_k)) + geom_line() + scale_x_log10()
+```
+
+## Map locations
+```{r}
+mean_count = x %>% 
+  filter(k == max(k)) %>%
+  mutate(cell = 1:2500) %>%
+  transmute(lat_ind = 1 + ((cell-1) %% n), 
+            lon_ind = 1 + ((cell-1)-lat_ind)/n,
+            n_scooters = value) %>%
+  pull(n_scooters) %>%
+  range() %>%
+  mean(na.rm = TRUE)
+
+x %>% 
+  filter(k == max(k)) %>%
+  mutate(cell = 1:2500) %>%
+  transmute(lat_ind = 1 + ((cell-1) %% n), 
+            lon_ind = 1 + ((cell-1)-lat_ind)/n,
+            n_scooters = value) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = n_scooters)) + geom_raster() + labs(fill = "Scooter count", x = "", y = "") + 
+  scale_fill_gradient2(low = "#173603", mid = "#83ff30", high = "#ffffff", midpoint = mean_count, na.value = "#173603") + 
+  coord_fixed(ratio = 1) + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    panel.background = element_blank()
+  )
+
+# Save for Stoneham
+ggsave("./final_dist.png", width = 5, height = 4) 
+```
+
+Compare to initial:
+```{r}
+tibble(value = d_0) %>%
+  mutate(cell = 1:2500) %>%
+  transmute(lat_ind = 1 + ((cell-1) %% n), 
+            lon_ind = 1 + ((cell-1)-lat_ind)/n,
+            n_scooters = value) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = n_scooters)) + geom_raster()
+```
+
+Compare to naive:
+```{r}
+p_naive = apply(demands, c(1,2), mean) %>% #take mean over all time/days
+  as.vector()
+p_naive[((0:2499)-((0:2499) %% n))/n < 10] = 0 # Get rid of outlier values
+
+d_naive = rep(0, n^2)
+for(k in 1:n_scooters){
+  cell = which.max(p_naive/sum(p_naive)-d_naive/k) #find the maximum difference between the demand (p) and current scooter proportion (d/k)
+  d_naive[cell] = d_naive[cell]+1
+}
+
+sum(d_naive)
+d_naive
+
+tibble(value = d_naive) %>%
+  mutate(cell = 1:2500) %>%
+  transmute(lat_ind = 1 + ((cell-1) %% n), 
+            lon_ind = 1 + ((cell-1)-lat_ind)/n,
+            n_scooters = value) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = n_scooters)) + geom_raster()
+
+get_revenue(d_naive)
+```
+

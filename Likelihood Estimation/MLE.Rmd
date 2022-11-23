@@ -1,0 +1,74 @@
+---
+title: "MLE"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2020/07/24
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/Scott/Box/MPhil/") #mac: "~/Box/MPhil" windows: "C:/Users/Scott/Box/MPhil/"
+
+#Libraries
+library(tidyverse)
+library(lubridate)
+library(sp)
+library(leaflet)
+library(gridExtra)
+
+#R options
+options("lubridate.week.start" = 1) #set first day of week to Monday instead of Sunday
+
+```
+
+All MLEs done in MATLAB
+
+## Initial estimation
+
+estimateMLE_singleCell: estimates $\lambda$ for a single cell, as binned by binCoordData.rmd. The calculations in this script were then rewritten into a function to calculate lambda for any single cell, estimateMLE. estimateMLE_AllCells calculates $\lambda$ for all cells, and plots both the change in scooters over time and the estimated value of $\lambda$.
+
+Problems:
+
+* Lambda is not split by time of day or day of week
+* The number of scooters may not be accurate as it does not utilise the snapshot data
+
+
+
+## Updated algorithm:
+
+### Main algorithm:
+
+1. Bin both the ride and snapshot data (R)
+  + Filtered to Adelaide only
+  + Ride data is filtered to match the snapshot data availability (after June 18th 2019)
+  + Bins are numbered sequentially from 0 to $n^2-1$; by latitude (south to north) then by latitude (west to east)
+2. Data saved for matlab: Rides; time of event, type of event (hire/dropoff), cell number of event. Snapshots; time of snapshot, cell number of scooter
+3. For each cell number:
+  + Obtain scooter count over time from snapshots (algorithm 2)
+  + Obtain the MLE for lambda given the ride data, the cell number, the scooter count over time, and the selected time of day/day of week (algorithm 3)
+4. Save/plot lambda as a matrix/surfplot
+
+### Vehicle count algorithm:
+
+1. Filter the data by cell number and verify the time filtering
+2. Find each unique DataDate value ( = unique snapshot time) and their indices
+3. For each unique time $i = 1,...,n_{times}$, there are $ind_{i+1}-ind_{i}$ scooters in the cell, with $ind_{n_{times}+1}$ equal to the total number of snapshots
+
+### MLE Algorithm:
+
+1. Filter the data by cell number and verify time filtering
+2. Filter the data to only include pickups or dropoffs that are in the selected time window and selected day of the week
+3. Find the number of hires and dropoffs, and construct a single table with all events in the cell in order 
+4. Split the table by calendar day (as the time interval is discontinuous)
+5. For each calendar day:
++ Find the last scooter count (from the snapshot data) that occurs before the first event
++ Estimate $\lambda$ based on this scooter count and the list of events (see algorithm 4)
+
+### Lambda estimation algorithm:
+
+1. recalculate the number of hires/dropoffs/events
+2. Find the change in scooters over time; a hire is -1 scooter in the cell, a dropoff is +1
+3. Find the total number of scooters in the cell at any time as the initial scooter count plus the change in scooters over time
+4. Find the intervals of time where there are no scooters present
+5. Estimate lambda as $\hat{\lambda}$ = nHires/(sum of time when there is a scooter present)
+

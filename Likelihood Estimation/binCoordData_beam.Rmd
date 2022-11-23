@@ -1,0 +1,200 @@
+---
+title: "Bin Coordinate Data - Beam"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/03/29
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = "../") #mac: "~/Box/MPhil" windows: "C:/Users/Scott/Box/MPhil/"
+
+#Libraries
+pacman::p_load(tidyverse, lubridate, sp, leaflet)
+#Functions
+
+source('../Likelihood Estimation/bin_coords.R')
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+options(pillar.sigfig = 7)
+```
+
+## Load data
+
+```{r loadData_rides}
+data = as_tibble(read.csv("../Data Analysis/beam_ridesCleaned.csv", row.names = 1))
+data
+```
+
+## Bin Data
+Bin the data using the non-built in R function bin_coords. Minimum/maximum coordinates are the tight CBD bounds. 
+```{r binData_rides}
+n = 50 #n bins on each axis
+minlat = -34.9425
+maxlat = -34.8975
+minlon = 138.575
+maxlon = 138.625
+
+# Get distance in km between points
+lat = rep(c(minlat, maxlat), 2)
+lon = rep(c(minlon, maxlon), each = 2)
+X = cbind(lon, lat)
+dist = spDists(X, longlat = TRUE)
+dist
+X %>% leaflet() %>% addTiles() %>% addMarkers()
+
+# Filter to binning range
+data = data %>%
+  filter(start_lat > minlat, start_lat < maxlat, start_lon > minlon, start_lon < maxlon,
+         end_lat > minlat, end_lat < maxlat, end_lon > minlon, end_lon < maxlon)
+
+
+pickupLat = data$start_lat
+pickupLon = data$start_lon
+
+pickupList = bin_coords(pickupLat, pickupLon, n, minlat, maxlat, minlon, maxlon)
+pickupInd = pickupList[[1]]
+pickupBreaks = pickupList[[2]]
+pickupInd
+pickupBreaks
+
+
+dropoffLat = data$end_lat
+dropoffLon = data$end_lon
+
+dropoffList = bin_coords(dropoffLat, dropoffLon, n, minlat, maxlat, minlon, maxlon)
+dropoffInd = dropoffList[[1]]
+dropoffBreaks = dropoffList[[2]]
+dropoffInd
+dropoffBreaks
+
+ggplot() +
+  geom_bin2d(aes(x = longitudeInd, y = latitudeInd), rbind(pickupInd, dropoffInd), binwidth = 1)
+```
+
+## Construct lists with each
+A new data frame is constructed with pickup/dropoff times and the cell numbers for each trip.
+```{r constructDataFrameByCell_rides}
+#Construct data frame
+dataCell = data %>%
+  add_column(start_lat_ind = pickupInd$latitudeInd,
+             start_lon_ind = pickupInd$longitudeInd,
+             end_lat_ind = dropoffInd$latitudeInd,
+             end_lon_ind = dropoffInd$longitudeInd)
+                 
+#Add cell number
+dataCell = dataCell %>%
+  mutate(pickup_cell_num = (start_lat_ind-1) + n*(start_lon_ind-1),
+         dropoff_cell_num = (end_lat_ind-1) + n*(end_lon_ind-1))
+#Sort by time in each cell
+dataCell = dataCell %>%
+  group_by(pickup_cell_num, dropoff_cell_num) %>%
+  arrange(ymd_hms(start_time))
+
+dataCell
+```
+
+## Plot movement between cells
+The inter-cell movement is plotted. 
+```{r plotMovementBetweenCells_rides}
+#nInCell = summarise(dataCell, n = length(pickupTime))
+ggplot(dataCell, aes(x = pickup_cell_num, y = dropoff_cell_num)) +
+  scale_fill_distiller(palette= "Set3", direction=1) +
+  geom_bin2d(binwidth = 1)
+
+dataCell %>%
+  group_by(pickup_cell_num, dropoff_cell_num) %>%
+  summarise(n = n(), start_lat = mean(start_lat), start_lon = mean(start_lon), end_lat = mean(end_lat), end_lon = mean(end_lon)) %>% 
+  arrange(-n)
+
+
+top_trips = dataCell %>%
+  group_by(pickup_cell_num, dropoff_cell_num) %>%
+  summarise(n = n(), start_lat = mean(start_lat), start_lon = mean(start_lon), end_lat = mean(end_lat), end_lon = mean(end_lon)) %>% 
+  ungroup() %>%
+  arrange(-n) %>%
+  slice_max(n, n = 10) %>%
+  transmute(trip = paste(pickup_cell_num, dropoff_cell_num))
+
+dataCell %>% 
+  mutate(trip = paste(pickup_cell_num, dropoff_cell_num)) %>%
+  filter(trip %in% top_trips$trip) %>%
+  ggplot(aes(x = trip_duration, col = trip)) + geom_density(alpha = 0.5) +
+  geom_density(aes(x = trip_duration, col = NULL), data = dataCell)
+```
+
+## Look at tour vs. non-tour
+```{r}
+dataCell %>%
+  mutate(is_tour = pickup_cell_num == dropoff_cell_num) %>%
+  ggplot(aes(x = trip_duration, col = is_tour)) + geom_histogram(binwidth = 60)
+
+dataCell %>%
+  mutate(is_tour = pickup_cell_num == dropoff_cell_num) %>%
+  ggplot(aes(x = trip_duration, y = trip_distance, col = is_tour)) + geom_point()
+
+dataCell %>%
+  mutate(is_tour = pickup_cell_num == dropoff_cell_num) %>%
+  ggplot(aes(x = trip_distance, col = is_tour)) + geom_histogram(binwidth = 20)
+```
+
+## Save binned data
+
+```{r saveData_rides}
+write.csv(dataCell, "../Likelihood Estimation/trips_binned_beam.csv")
+```
+
+
+# Status data
+## Load data
+
+```{r loadData}
+data = as_tibble(read.csv("../Data Analysis/beam_statusCleaned.csv", row.names = 1))
+data
+```
+
+## Bin Data
+Bin the data using the non-built in R function bin_coords. Minimum/maximum coordinates are the tight CBD bounds. 
+```{r binData}
+# Filter to binning range
+data = data %>%
+  filter(lat > minlat, lat < maxlat, lon > minlon, lon < maxlon)
+
+
+lat = data$lat
+lon = data$lon
+
+binnedList = bin_coords(lat, lon, n, minlat, maxlat, minlon, maxlon)
+binnedInd = binnedList[[1]]
+binnedBreaks = binnedList[[2]]
+
+ggplot() +
+  geom_bin2d(aes(x = longitudeInd, y = latitudeInd), binnedInd, binwidth = 1)
+```
+
+## Construct lists with each
+A new data frame is constructed with pickup/dropoff times and the cell numbers for each trip.
+```{r constructDataFrameByCell}
+#Construct data frame
+dataCell = data %>%
+  add_column(lat_ind = binnedInd$latitudeInd,
+             lon_ind = binnedInd$longitudeInd)
+                 
+#Add cell number
+dataCell = dataCell %>%
+  mutate(cell_num = (lat_ind-1) + n*(lon_ind-1))
+#Sort by time in each cell
+dataCell = dataCell %>%
+  group_by(cell_num) %>%
+  arrange(ymd_hms(event_time))
+
+dataCell
+```
+
+
+## Save binned data
+
+```{r saveData}
+write.csv(dataCell, "../Likelihood Estimation/status_binned_beam.csv")
+```

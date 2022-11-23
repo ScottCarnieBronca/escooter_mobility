@@ -1,0 +1,63 @@
+---
+title: "Estimate demand - Beam data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/08/02
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+pacman::p_load(tidyverse, lubridate, sp, leaflet)
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+```
+
+# Load demands and status data
+
+
+```{r}
+n = 50
+demand = read.table("../Likelihood Estimation/estimatedLambda_beam.csv", sep = ",") %>% as.matrix() %>% matrix(ncol = 1)
+status = read.csv("../Likelihood Estimation/status_binned_beam.csv", row.names = 1) %>% as_tibble()
+```
+
+# Demand map
+```{r}
+demand_table = tibble(d = demand[,], cell_num = 0:(n^2-1))
+
+
+demand_table %>% mutate(lat_ind = ((cell_num + 1) %% n), lon_ind = ((cell_num) %/% n) + 1) %>%
+  complete(lat_ind = 1:50, lon_ind = 1:50, fill = list(d = 0)) %>%
+  mutate(d = d*3600) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = d)) + 
+  geom_raster() + labs(fill = "Demand (hires/hr)", x = "", y = "") + 
+  scale_fill_gradient2(low = "#290e00", mid = "#ff5a00", high = "#ffffff", midpoint = 1, na.value = "#290e00") + 
+  coord_fixed(ratio = 1) + 
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    panel.background = element_blank()
+  )
+
+
+```
+
+# Map of top locations
+```{r}
+top_cells = demand_table %>% slice_max(d, n = 10) %>% pull(cell_num)
+top_cells
+
+status %>% filter(cell_num %in% top_cells) %>%
+  group_by(cell_num) %>%
+  summarise(lat = mean(lat), lon = mean(lon)) %>%
+  select(lon, lat) %>%
+  as.matrix() %>%
+  leaflet() %>%
+  addTiles() %>%
+  addMarkers
+
+```

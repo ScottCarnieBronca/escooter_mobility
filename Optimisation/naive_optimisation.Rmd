@@ -1,0 +1,104 @@
+---
+title: "Naive redistribution optimisation"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/03/23
+# Scott Carnie-Bronca
+
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+pacman::p_load(tidyverse, lubridate, sp, leaflet, gridExtra)
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+```
+
+## Load estimated demand
+```{r}
+n = 10
+demand = read.csv("../Likelihood Estimation/estimatedLambda.csv", header = FALSE) %>% as.matrix() %>% as.vector() %>% as_tibble() %>% add_column(pickupCellNum = 1:100)
+
+# Trip duration - only need the mean values
+trip_time = read.csv("../Simulation/lambdas_erlang2.csv", header = TRUE) %>% as_tibble() %>% transmute(pickupCellNum, dropoffCellNum, mean_duration = 2/Lambda1) %>%
+  mutate(pickupCellNum = pickupCellNum + 1, dropoffCellNum = dropoffCellNum + 1)
+
+# Trip destinations
+trip_dest = read.csv("../Simulation/trip_destinations.csv", row.names = 1) %>% as_tibble()
+
+# Expected trip duration from initial locations
+trip_lengths = trip_dest %>% 
+  mutate(pickupCellNum = 1 + (pickupLatInd-1) + 10*(pickupLonInd-1),
+         dropoffCellNum = 1 + (dropoffLatInd-1) + 10*(dropoffLonInd-1)) %>% 
+  full_join(trip_time, by = c("pickupCellNum", "dropoffCellNum")) %>%
+  group_by(pickupCellNum) %>%
+  summarise(expected_time = sum(mean_duration*p)) %>%
+  full_join(demand, by = c("pickupCellNum")) %>%
+  rename(demand_rate = value)
+```
+
+## Function to find revenue over time
+```{r}
+getRevenue = function(deployment, max_time, trip_lengths){
+  df = trip_lengths %>%
+    mutate(expected_trips = demand_rate*max_time) %>%
+    full_join(deployment, by = "pickupCellNum") %>%
+    mutate(hired_scooters = floor(pmin(scooters, expected_trips)),
+           expected_profit = hired_scooters*(1 + 0.25*(1/60)*expected_time))
+           
+  return(list(profit = sum(df$expected_profit), trips = sum(df$hired_scooters), missed_trips = sum(df$expected_trips-df$hired_scooters)))
+}
+
+```
+## Naive allocation of scooters
+
+```{r}
+n_scooters = 400 #Number of scooters in system (to allocate)
+
+deployment = demand %>% mutate(scooters = round(n_scooters*(value/sum(value)))) %>% select(-value)
+
+getRevenue(deployment, 3600*1, trip_lengths)
+
+revenue = rep(NA, 1+48*6)
+trips = rep(NA, 1+48*6)
+missed_trips = rep(NA, 1+48*6)
+
+for(k in 0:(48*6)){
+  temp = getRevenue(deployment, 600*k, trip_lengths)
+  revenue[k] = temp[[1]]
+  trips[k] = temp[[2]]
+  missed_trips[k] = temp[[3]]
+}
+plot((0:(48*6))/6, revenue)
+plot((0:(48*6))/6, trips)
+plot((0:(48*6))/6, missed_trips)
+```
+
+## Test dumping all scooters at the train station:
+
+```{r}
+n_scooters = 400 #Number of scooters in system (to allocate)
+
+deployment = demand
+deployment$scooters = 0
+deployment$scooters[which.max(deployment$value)] = n_scooters
+
+getRevenue(deployment, 3600*1, trip_lengths)
+
+revenue = rep(NA, 1+48*6)
+trips = rep(NA, 1+48*6)
+missed_trips = rep(NA, 1+48*6)
+
+for(k in 0:(48*6)){
+  temp = getRevenue(deployment, 600*k, trip_lengths)
+  revenue[k] = temp[[1]]
+  trips[k] = temp[[2]]
+  missed_trips[k] = temp[[3]]
+}
+plot((0:(48*6))/6, revenue)
+plot((0:(48*6))/6, trips)
+plot((0:(48*6))/6, missed_trips)
+```

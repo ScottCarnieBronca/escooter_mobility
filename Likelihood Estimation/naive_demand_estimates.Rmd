@@ -1,0 +1,145 @@
+---
+title: "naive demand estimates: both data sets"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/08/12
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+pacman::p_load(tidyverse, lubridate, sp, leaflet, xtable, mapview, sf)
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+```
+
+# Parameters
+```{r}
+n = 50
+```
+
+# Ride
+```{r}
+# Read data
+trips_ride = read.csv("./binnedData_50.csv", row.names = 1) %>% as_tibble()
+
+# Get the total range of data in seconds
+range_ride = range(as.numeric(ymd_hms(c(trips_ride$pickupTime, trips_ride$dropoffTime))))
+ 
+naive_demand_ride = trips_ride %>%
+  group_by(pickupCellNum) %>%
+  summarise(n_hires = n(), demand = n()/diff(range_ride)) %>%
+  complete(pickupCellNum = 0:(n^2-1), fill = list(n = 0, demand = 0))
+
+naive_demand_ride %>% arrange(-demand)
+```
+
+# Beam
+```{r}
+# Read data
+trips_beam = read.csv("../Binning for Thesis/trips_binned_grid_beam_50.csv", row.names = 1) %>% as_tibble()
+
+range_beam = range(as.numeric(ymd_hms(c(trips_beam$start_time, trips_beam$end_time))))
+
+naive_demand_beam = trips_beam %>%
+  group_by(pickup_cell_num) %>%
+  summarise(n_hires = n(), demand = n()/diff(range_beam)) %>%
+  complete(pickup_cell_num = 0:(n^2-1), fill = list(n = 0, demand = 0))
+
+naive_demand_beam %>% arrange(-demand)
+```
+
+# Plots
+```{r}
+naive_combined = full_join(naive_demand_ride %>% rename(pickup_cell_num = pickupCellNum), naive_demand_beam, by = "pickup_cell_num", suffix = c(".ride", ".beam"))
+naive_combined %>%
+  pivot_longer(cols = contains("demand")) %>%
+  mutate(lat_ind = ((pickup_cell_num) %% n) + 1, lon_ind = ((pickup_cell_num) %/% n) + 1,
+         name = case_when(
+            name == "demand.beam" ~ "Beam",
+            name == "demand.ride" ~ "Ride",
+            TRUE                  ~ "NA"
+         )) %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = value)) + geom_tile() + facet_wrap(~name) + coord_fixed() +
+  labs(x = "Longitude index", y = "Latitude index", fill = "Demand")
+```
+
+```{r}
+ggsave("../Thesis/likelihood_estimation/figs/naive_estimates.pdf", scale = 1, width = 3.5, height = 3)
+```
+
+```{r}
+naive_combined %>%
+  pivot_longer(cols = contains("demand")) %>%
+  mutate(lat_ind = ((pickup_cell_num) %% n) + 1, lon_ind = ((pickup_cell_num) %/% n) + 1,
+         name = case_when(
+            name == "demand.beam" ~ "Beam",
+            name == "demand.ride" ~ "Ride",
+            TRUE                  ~ "NA"
+         )) %>%
+  filter(name == "Beam") %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = value)) + geom_tile() + facet_wrap(~name) + coord_fixed() +
+  labs(x = "Longitude index", y = "Latitude index", fill = "Demand")
+
+```
+
+```{r}
+ggsave("../Thesis/likelihood_estimation/figs/naive_estimate_beam.pdf", scale = 1, width = 3.5, height = 3)
+```
+
+```{r}
+naive_combined %>%
+  pivot_longer(cols = contains("demand")) %>%
+  mutate(lat_ind = ((pickup_cell_num) %% n) + 1, lon_ind = ((pickup_cell_num) %/% n) + 1,
+         name = case_when(
+            name == "demand.beam" ~ "Beam",
+            name == "demand.ride" ~ "Ride",
+            TRUE                  ~ "NA"
+         )) %>%
+  filter(name == "Ride") %>%
+  ggplot(aes(x = lon_ind, y = lat_ind, fill = value)) + geom_tile() + facet_wrap(~name) + coord_fixed() +
+  labs(x = "Longitude index", y = "Latitude index", fill = "Demand")
+```
+```{r}
+ggsave("../Thesis/likelihood_estimation/figs/naive_estimate_ride.pdf", scale = 1, width = 3.5, height = 3)
+```
+
+# Create tables
+```{r}
+combined_demand = naive_demand_beam %>%
+  arrange(-demand) %>%
+  filter(row_number() <= 10) %>%
+  select(-n_hires) %>%
+  rename(Cell = pickup_cell_num, Demand = demand)%>%
+  xtable(digits = c(NA, 4, 8), 
+         caption = c("List of the top 10 cells by na\"ive demand estimate using Beam data.", "Na\\\"ive demand estimation - Beam data")) %>%
+  print.xtable(file = "../Thesis/likelihood_estimation/tables/naive_demand_beam.txt",
+               include.rownames = FALSE)
+              
+naive_demand_ride %>%
+  arrange(-demand) %>%
+  filter(row_number() <= 10) %>%
+  select(-n_hires) %>%
+  rename(Cell = pickupCellNum, Demand = demand) %>%
+  xtable(digits = c(NA, 4, 8), 
+         caption = c("List of the top 10 cells by na\"ive demand estimate using Ride data.", "Na\\\"ive demand estimation - Ride data")) %>%
+  print.xtable(file = "../Thesis/likelihood_estimation/tables/naive_demand_ride.txt",
+               include.rownames = FALSE)
+                
+```
+
+Mapview plots:
+```{r}
+coord_grid = st_read(paste0("../Binning for Thesis/Shapefiles/grid_", n, ".shp")) %>%
+      left_join(naive_combined, by = c("FID" = "pickup_cell_num")) %>%
+  mutate(demand.beam = demand.beam * 3600,
+         demand.ride = demand.ride * 3600)
+
+coord_grid %>% mapview(zcol = "demand.ride")
+coord_grid %>% mapview(zcol = "demand.beam")
+
+coord_grid %>% mapview(zcol = "demand.ride") %>% mapshot(file = "./naive_estimates_ride_map.png")
+coord_grid %>% mapview(zcol = "demand.beam") %>% mapshot(file = "./naive_estimates_beam_map.png")
+```

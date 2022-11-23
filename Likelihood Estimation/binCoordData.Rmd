@@ -1,0 +1,272 @@
+---
+title: "Bin Coordinate Data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2021/10/28 - Updated to match grid size to Beam binning
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+library(tidyverse)
+library(lubridate)
+library(sp)
+library(leaflet)
+library(gridExtra)
+library(skimr)
+
+#Functions
+
+source('../Likelihood Estimation/bin_coords.R')
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+```
+
+## Load data
+
+```{r loadData}
+data = as_tibble(read.csv("../Data Analysis/ridesDataAnalysis.csv", row.names = 1))
+data
+```
+
+Remove rows with invalid/unreasonable coordinates. Note: some rows appear to have coordinates swapped.
+```{r removeInvalidCoords}
+minlat = -34.9425
+maxlat = -34.8975
+minlon = 138.575
+maxlon = 138.625
+
+data = data %>%
+  filter(pickupGeo0 >= minlon & pickupGeo0 <= maxlon & pickupGeo1 >= minlat & pickupGeo1 <= maxlat & +
+           dropoffGeo0 >= minlon & dropoffGeo0 <= maxlon & dropoffGeo1 >= minlat & dropoffGeo1  <= maxlat)
+data
+```
+
+## Bin Data
+Bin the data using the non-built in R function bin_coords. Minimum/maximum coordinates are the tight CBD bounds. 
+```{r binData}
+n = 100 #n bins on each axis
+
+
+pickupLat = data$pickupGeo1
+pickupLon = data$pickupGeo0
+
+pickupList = bin_coords(pickupLat, pickupLon, n, minlat, maxlat, minlon, maxlon)
+pickupInd = pickupList[[1]]
+pickupBreaks = pickupList[[2]]
+pickupInd
+pickupBreaks
+
+
+dropoffLat = data$dropoffGeo1
+dropoffLon = data$dropoffGeo0
+
+dropoffList = bin_coords(dropoffLat, dropoffLon, n, minlat, maxlat, minlon, maxlon)
+dropoffInd = dropoffList[[1]]
+dropoffBreaks = dropoffList[[2]]
+dropoffInd
+dropoffBreaks
+
+ggplot() +
+  geom_bin2d(aes(x = longitudeInd, y = latitudeInd), rbind(pickupInd, dropoffInd), binwidth = 1)
+```
+
+## Construct lists with each
+A new data frame is constructed with pickup/dropoff times and the cell numbers for each trip.
+```{r constructDataFrameByCell}
+#Construct data frame
+dataCell = data %>%
+  add_column(pickupLatInd = pickupInd$latitudeInd,
+             pickupLonInd = pickupInd$longitudeInd,
+             dropoffLatInd = dropoffInd$latitudeInd,
+             dropoffLonInd = dropoffInd$longitudeInd) %>%
+  rename(pickupTime = pickupTs,
+         dropoffTime = dropoffTs)
+
+#Add cell number
+dataCell = dataCell %>%
+  mutate(pickupCellNum = (pickupLatInd-1) + n*(pickupLonInd-1),
+         dropoffCellNum = (dropoffLatInd-1) + n*(dropoffLonInd-1))
+#Sort by time in each cell
+dataCell = dataCell %>%
+  group_by(pickupCellNum, dropoffCellNum) %>%
+  arrange(pickupTime)
+
+dataCell
+```
+
+## Plot movement between cells
+The inter-cell movement is plotted. Note that nBins=n < n^2, so consecutive cells are plotted at the same point.
+```{r plotMovementBetweenCells}
+#nInCell = summarise(dataCell, n = length(pickupTime))
+ggplot(dataCell, aes(x = pickupCellNum, y = dropoffCellNum)) +
+  scale_fill_distiller(palette= "Set3", direction=1) +
+  geom_bin2d(binwidth = 1)
+```
+
+
+It appears that most scooters stay in their own cells, from the strong diagonal line.
+
+<!-- ## Select a cell and generate list of hires/dropoffs -->
+
+
+<!-- ```{r individualCell} -->
+<!-- cellNum = 4546 #cell number, from 0 to n^2-1 -->
+
+<!-- #Pickup events: -->
+<!-- pickupTimes = dataCell %>% -->
+<!--   group_by() %>% -->
+<!--   filter(pickupCellNum == cellNum) %>% -->
+<!--   select(pickupTime) -->
+<!-- pickupTimes = ymd_hms(pickupTimes$pickupTime) -->
+
+<!-- dropoffTimes = dataCell %>% -->
+<!--   group_by() %>% -->
+<!--   filter(dropoffCellNum == cellNum) %>% -->
+<!--   select(dropoffTime) -->
+<!-- dropoffTimes = ymd_hms(dropoffTimes$dropoffTime) -->
+
+<!-- eventTimes = c(pickupTimes, dropoffTimes) -->
+<!-- eventTypes = c(rep("H", length(pickupTimes)), rep("D", length(dropoffTimes))) -->
+<!-- events = tibble(times = eventTimes, types = as.factor(eventTypes)) -->
+<!-- events = events%>% -->
+<!--   arrange(times) -->
+<!-- events -->
+<!-- ``` -->
+
+## Save binned data
+
+```{r saveData}
+write.csv(dataCell, "../Likelihood Estimation/binnedData.csv")
+```
+
+
+## Snapshot Data
+```{r}
+data.snapshot = as_tibble(read.csv("../Data Analysis/snapshotsCleaned.csv"))
+data.snapshot = data.snapshot %>%
+  mutate(DataDate = ymd_hms(DataDate)) %>%
+  select(DataDate, geo0, geo1, number)
+```
+
+Filter the snapshot data by time. Due to the lack of snapshot data for earlier times and the jump in scooter numbers on June 17th, June 18th onwards is chosen for parameter estimation.
+```{r}
+t0 = as.POSIXct("2019-06-18 00:00:00") #initial time
+tF = as.POSIXct("2019-7-10 03:00:00") #final time, greater than the last time in the snapshot data
+data.snapshot = data.snapshot %>%
+  filter(DataDate >= t0 & DataDate <= tF)
+```
+
+Filter the data by location - all points should be in Adelaide.
+```{r}
+data.snapshot = data.snapshot %>%
+  filter(geo0 >= minlon & geo0 <= maxlon & geo1 >= minlat & geo1 <= maxlat)
+data.snapshot
+```
+
+Bin the data, similar to the ride data
+```{r}
+lat = data.snapshot$geo1
+lon = data.snapshot$geo0
+
+list = bin_coords(lat, lon, n, minlat, maxlat, minlon, maxlon)
+data.snapshot.binned = list[[1]]
+breaks = list[[2]]
+data.snapshot.binned
+breaks
+
+data.snapshot.binned = data.snapshot.binned %>%
+  mutate(cellNum = latitudeInd-1 + n*(longitudeInd-1), DataDate = data.snapshot$DataDate, number = data.snapshot$number)
+data.snapshot.binned
+```
+
+```{r}
+write.csv(data.snapshot.binned, "../Likelihood Estimation/snapshotBinned.csv")
+```
+
+Plot of cells with scooters:
+```{r}
+data.snapshot.binned %>%
+  group_by(DataDate, cellNum) %>%
+  summarise(n_scooters = n()) %>%
+  ungroup() %>%
+  group_by(DataDate) %>%
+  complete(cellNum = 0:(n^2-1), fill = list("n_scooters" = 0)) %>%
+  summarise(p = sum(n_scooters > 0)/n^2) %>%
+  ggplot(aes(x = DataDate, y = p)) + geom_line() + coord_cartesian(ylim = c(0, 0.25)) + labs(x = "Time", y = "Proportion of cells with scooters") + theme_bw()
+
+ggsave("./cells_with_scooters_ride.pdf", width = 6, height = 4) 
+```
+
+# Sizes of cells
+```{r}
+x = matrix(c(minlon, maxlon, minlon, maxlon, minlat, minlat, maxlat, maxlat), ncol = 2)
+spDists(x, longlat = TRUE)*(1000/n)
+```
+
+# Plot of corners
+```{r}
+pacman::p_load(mapview, sf)
+
+#x %>% leaflet() %>% addTiles %>% addCircleMarkers() %>% mapshot(file = "./corners.png")
+tibble(longitude = x[,1], latitude = x[,2]) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  mapview(legend = FALSE)
+
+tibble(longitude = x[,1], latitude = x[,2]) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  mapview(legend = FALSE) %>%
+  mapshot(file = "./corners.png")
+```
+
+```{r}
+tibble(longitude = x[,1], latitude = x[,2]) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  st_make_grid(n = c(4, 4)) %>%
+  mapview(legend = TRUE)
+
+tibble(longitude = x[,1], latitude = x[,2]) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  st_make_grid(n = c(4, 4)) %>%
+  mapview(legend = TRUE) %>%
+  mapshot(file = "./smallgrid.png")
+
+tibble(longitude = x[,1], latitude = x[,2]) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  st_make_grid(n = c(100, 100), square = FALSE) %>%
+  mapview(alpha = 0.1)
+```
+
+# Save grid for plotting as spatialpolygons
+```{r}
+grid_corners = pickupBreaks %>% as.matrix #n+1 rows, col 1 = lat, col 2 = lon
+polygon_list = list(n^2)
+for(k in 1:n^2){
+  lat_ind = ((k-1) %% n) + 1
+  lon_ind = ((k-1) %/% n) + 1
+  polygon_list[[k]] = matrix(
+    c(
+     grid_corners[lon_ind, 2],   grid_corners[lat_ind, 1],
+     grid_corners[lon_ind, 2],   grid_corners[lat_ind+1, 1],
+     grid_corners[lon_ind+1, 2], grid_corners[lat_ind+1, 1],
+     grid_corners[lon_ind+1, 2], grid_corners[lat_ind, 1],
+     grid_corners[lon_ind, 2],   grid_corners[lat_ind, 1]
+    ),
+    nrow = 5, byrow = TRUE
+  ) %>%
+    list() %>%
+    Polygon() %>%
+    list() %>%
+    Polygons(ID = k-1)
+}
+
+spatial_polygons_list = polygon_list %>%
+  SpatialPolygons(proj4string = CRS("+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0")) %>%
+  st_as_sfc
+
+spatial_polygons_list %>% mapView()
+
+spatial_polygons_list %>% st_write("./grid.shp", append = FALSE)
+```

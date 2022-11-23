@@ -1,0 +1,169 @@
+---
+title: "Bin Coordinate Data - Kmeans Clustering"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2020/07/23
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/Box/MPhil") #mac: "~/Box/MPhil" windows: "C:/Users/Scott/Box/MPhil/"
+
+#Libraries
+library(tidyverse)
+library(lubridate)
+library(sp)
+library(leaflet)
+library(gridExtra)
+
+#Functions
+source('~/Box/MPhil/Likelihood Estimation/bin_coords_kmeans.R')
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+```
+
+## Load data
+
+```{r loadData}
+data = as_tibble(read.csv("Data Analysis/ridesDataAnalysis.csv", row.names = 1))
+data
+
+dataS = as_tibble(read.csv("Data Analysis/snapshotDataAnalysis.csv", row.names = 1))
+dataS
+```
+
+Remove rows with invalid/unreasonable coordinates. Note: some rows appear to have coordinates swapped.
+```{r removeInvalidCoords}
+data = data %>%
+  filter(pickupGeo0 >= 138.585 & pickupGeo0 <= 138.62 & pickupGeo1 >= -34.94 & pickupGeo1 <= -34.915 & +
+        dropoffGeo0 >= 138.585 & dropoffGeo0 <= 138.62 & dropoffGeo1 >= -34.94 & dropoffGeo1  <= -34.915)
+data
+```
+
+## Bin Data
+Bin the data using the non-built in R function bin_coords_kmeans. Minimum/maximum coordinates are the tight CBD bounds. NOT WORKING, NEED TO FIX bin_coords_kmeans.R
+```{r binData}
+k = 5 #number of clusters
+dataCoordsP = tibble(lat = data$pickupGeo1, lon = data$pickupGeo0, type = as.factor(rep("P", nrow(data))))
+dataCoordsD = tibble(lat = data$dropoffGeo1, lon = data$dropoffGeo0, type = as.factor(rep("D", nrow(data))))
+dataCoords = rbind(dataCoordsP, dataCoordsD)
+
+# Cluster the data - see bin_coords_kmeans.R. Both pickups and dropoffs are used.
+
+L = bin_coords_kmeans(select(dataCoords, lat, lon), k)
+clusters = L[[1]]
+L = L[[2]]
+dataCoords = dataCoords %>%
+  mutate(cluster = clusters$cluster)
+
+pickupCluster = dataCoords %>%
+  filter(type == "P") %>%
+  select(cluster)
+dropoffCluster = dataCoords %>%
+  filter(type == "D") %>%
+  select(cluster)
+
+#add the cluster indices to data
+dataCell = data %>%
+  mutate(pickupCluster = pickupCluster$cluster, 
+         dropoffCluster = dropoffCluster$cluster)
+```
+
+## Plot clusters
+```{r plotClusters}
+
+#Each cluster
+ggplot(dataCell, aes(x = pickupGeo0, y = pickupGeo1, color = factor(pickupCluster))) +
+  geom_point(alpha = 0.2, size = 0.25) +
+  geom_point(aes(x = dropoffGeo0, y = dropoffGeo1, color = factor(dropoffCluster)), alpha = 0.2, size = 0.25) +
+  xlab("Longitude") + ylab("Latitude") + ggtitle("Each cluster")
+
+#Where do the trips that end in each cluster come from
+ggplot(dataCell, aes(x = dropoffGeo0, y = dropoffGeo1, color = factor(pickupCluster))) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  xlab("Longitude") + ylab("Latitude") + ggtitle("Starting clusters")
+
+#Where do the trips that start in each cluster go to
+ggplot(dataCell, aes(x = pickupGeo0, y = pickupGeo1, color = factor(dropoffCluster))) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  xlab("Longitude") + ylab("Latitude") + ggtitle("Ending clusters")
+```
+
+
+## Construct lists with each
+A new data frame is constructed with pickup/dropoff times and the cell numbers for each trip.
+```{r constructDataFrameByCell}
+#Sort by time in each cell
+dataCell = dataCell %>%
+  group_by(pickupCluster, dropoffCluster) %>%
+  arrange(pickupTs)
+
+dataCell
+```
+
+## Plot movement between cells
+Plot the inter-cell movement:
+```{r plotMovementBetweenCells}
+#nInCell = summarise(dataCell, n = length(pickupTime))
+ggplot(dataCell, aes(x = pickupCluster, y = dropoffCluster)) +
+  #scale_fill_distiller(palette= "Set3", direction=1) +
+  geom_bin2d(binwidth = 1)
+```
+
+The diagonal line has high counts, indicating that a high proportion of scooter trips stay within each cell.
+
+## Select a cell and generate list of hires/dropoffs
+Generate list of events in a specific cell.
+```{r individualCell}
+cellNum = 1 #cell number, from 1 to k
+
+#Pickup events:
+pickupTimes = dataCell %>%
+  group_by() %>%
+  filter(pickupCluster == cellNum) %>%
+  select(pickupTs)
+pickupTimes = ymd_hms(pickupTimes$pickupTs)
+
+dropoffTimes = dataCell %>%
+  group_by() %>%
+  filter(dropoffCluster == cellNum) %>%
+  select(dropoffTs)
+dropoffTimes = ymd_hms(dropoffTimes$dropoffTs)
+
+eventTimes = c(pickupTimes, dropoffTimes)
+eventTypes = c(rep("H", length(pickupTimes)), rep("D", length(dropoffTimes)))
+events = tibble(times = eventTimes, types = as.factor(eventTypes))
+events = events%>%
+  arrange(times)
+events
+```
+
+## Bin snapshot data
+The snapshot data is binned using the clusters from the rides data:
+```{r binSnapshots}
+dataS = as_tibble(read.csv("Data Analysis/snapshotDataAnalysis.csv", row.names = 1))
+coordsS = dataS %>%
+  select(geo0, geo1) %>%
+  coordinates()
+
+centroids = L[[2]]
+centroids[,1:2] = centroids[,2:1] #swap columns; should be lon then lat
+
+centroidDistance = spDists(coordsS, centroids, longlat = TRUE) #in km
+
+snapshotCluster = rep(0, nrow(centroidDistance))
+for(k in seq(1:nrow(centroidDistance))){
+  snapshotCluster[k] = which.min(centroidDistance[k,])
+}
+
+dataS = dataS %>%
+  mutate(cell = snapshotCluster)
+```
+
+## Save binned data
+
+```{r saveData}
+write.csv(dataCell, "Likelihood Estimation/binnedData_kmeans.csv")
+write.csv(dataS, "Likelihood Estimation/binnedSnapshotData_kmeans.csv")
+```

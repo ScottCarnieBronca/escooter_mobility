@@ -1,0 +1,58 @@
+---
+title: "Data Binning - Actual Map"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# LAST UPDATED: 2020/07/23
+# Scott Carnie-Bronca
+knitr::opts_chunk$set(echo = TRUE)
+
+#Libraries
+library(tidyverse)
+library(lubridate)
+library(sp)
+library(leaflet)
+library(gridExtra)
+library(sf)
+library(ggmap)
+library(mapview)
+
+#R options
+options("lubridate.week.start"=1) #set first day of week to Monday instead of Sunday
+```
+
+## Load the shapefiles
+```{r loadShapefiles}
+shapefileData = st_read("../Data/Adelaide Shapefiles/LandDevelopmentZones_GDA2020.shp")
+```
+
+## Plot
+```{r plotShapefile}
+ggplot() + 
+  geom_sf(data = shapefileData, size = 3, color = "black") + 
+  coord_sf()
+```
+
+Filter to only City of Adelaide:
+```{r plotAdelaide}
+dataAdelaide = shapefileData %>% filter(urban_cent == "CITY OF ADELAIDE")
+ggplot(dataAdelaide, aes(fill = factor(policy_mea))) + 
+  geom_sf() + 
+  coord_sf()
+```
+
+using leaflet:
+```{r plotAdelaide2}
+shape <- sf::st_transform(shapefileData)
+leaflet(shape) %>% addTiles() %>% addPolygons(fillColor = factor(shape$dev_catego))
+```
+
+Using mapview:
+```{r}
+shapefileData %>%
+  mapview(zcol = "dev_catego")
+
+shapefileData %>%
+  mapview(zcol = "zone_meani")
+```

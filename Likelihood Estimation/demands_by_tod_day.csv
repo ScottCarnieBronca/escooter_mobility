@@ -1,0 +1,11 @@
+"","time_desc","day_desc","desc","naive_demand","demand","bayes_demand"
+"1","EarlyMorning","Weekday","EarlyMorningWeekday",9.4792349726776,305.751897544741,21.3357282641516
+"2","EarlyMorning","Weekend","EarlyMorningWeekend",36.940379403794,1948.71270954632,84.5634438331513
+"3","Morning","Weekday","MorningWeekday",23.2417763157895,1121.86549034411,64.2930752328762
+"4","Morning","Weekend","MorningWeekend",26.0466392318244,1356.32029111667,59.4573882052289
+"5","EarlyAfternoon","Weekday","EarlyAfternoonWeekday",45.4155701754386,1801.11911847551,119.516781159582
+"6","EarlyAfternoon","Weekend","EarlyAfternoonWeekend",64.0653950953678,2057.00650109058,150.218401605914
+"7","Afternoon","Weekday","AfternoonWeekday",55.320197044335,2335.34623362254,159.474211875873
+"8","Afternoon","Weekend","AfternoonWeekend",86.5737704918033,5572.85339082033,223.636302377557
+"9","Evening","Weekday","EveningWeekday",46.004626569729,2057.05879706685,129.162484448821
+"10","Evening","Weekend","EveningWeekend",123.032786885246,4658.95357595955,345.549366145585
